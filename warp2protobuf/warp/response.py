@@ -111,6 +111,31 @@ def _trim_reasoning_block_cache() -> None:
         _REASONING_BLOCK_CACHE.pop(next(iter(_REASONING_BLOCK_CACHE)))
 
 
+def _get_reasoning_message_id(message: Any) -> str:
+    return getattr(message, "id", "") or ""
+
+
+def _extract_inline_reasoning(message: Any) -> Optional[str]:
+    if hasattr(message, "HasField"):
+        if message.HasField("agent_output") and message.agent_output.reasoning:
+            return message.agent_output.reasoning
+        if message.HasField("agent_reasoning") and message.agent_reasoning.reasoning:
+            return message.agent_reasoning.reasoning
+    return None
+
+
+def _cache_reasoning_append(message: Any, reasoning: Optional[str]) -> None:
+    if not reasoning:
+        return
+
+    message_id = _get_reasoning_message_id(message)
+    if not message_id:
+        return
+
+    _REASONING_BLOCK_CACHE[message_id] = _REASONING_BLOCK_CACHE.get(message_id, "") + reasoning
+    _trim_reasoning_block_cache()
+
+
 def _extract_reasoning_block(message: Any) -> Optional[str]:
     if not hasattr(message, "HasField") or not message.HasField("agent_reasoning"):
         return None
@@ -119,15 +144,27 @@ def _extract_reasoning_block(message: Any) -> Optional[str]:
     if not reasoning:
         return None
 
-    message_id = getattr(message, "id", "") or f"anonymous:{hash(reasoning)}"
+    message_id = _get_reasoning_message_id(message) or f"anonymous:{hash(reasoning)}"
     previous = _REASONING_BLOCK_CACHE.get(message_id)
     _REASONING_BLOCK_CACHE[message_id] = reasoning
     _trim_reasoning_block_cache()
 
     if previous == reasoning:
         return None
+
     if previous:
-        return f"\n\n{reasoning}"
+        common_prefix_len = 0
+        max_prefix_len = min(len(previous), len(reasoning))
+        while common_prefix_len < max_prefix_len and previous[common_prefix_len] == reasoning[common_prefix_len]:
+            common_prefix_len += 1
+
+        delta = reasoning[common_prefix_len:]
+        if delta:
+            return delta
+
+        # Fallback for unexpected rewrites/regressions in the snapshot payload.
+        return reasoning
+
     return reasoning
 
 
@@ -139,6 +176,15 @@ def _append_agent_output(result: Dict[str, Any], message: Any) -> None:
     if agent_output.text:
         result["content"] += agent_output.text
     _append_reasoning(result, agent_output.reasoning)
+
+
+def _append_inline_reasoning_delta(deltas: List[Dict[str, Any]], message: Any) -> None:
+    reasoning = _extract_inline_reasoning(message)
+    if not reasoning:
+        return
+
+    _cache_reasoning_append(message, reasoning)
+    _append_reasoning_delta(deltas, reasoning)
 
 
 def _append_tool_call(result: Dict[str, Any], message: Any, fallback_id: str) -> None:
@@ -259,21 +305,28 @@ def extract_openai_sse_deltas_from_response(payload: bytes) -> List[Dict[str, An
                     if message.HasField("agent_output"):
                         agent_output = message.agent_output
                         _append_text_delta(deltas, agent_output.text)
-                        _append_reasoning_delta(deltas, agent_output.reasoning)
+                    _append_inline_reasoning_delta(deltas, message)
                     _append_tool_call_deltas(deltas, message, f"call_{i}")
 
                 elif action.HasField("add_messages_to_task"):
                     for j, msg in enumerate(action.add_messages_to_task.messages):
                         if msg.HasField("agent_output"):
                             _append_text_delta(deltas, msg.agent_output.text)
-                            _append_reasoning_delta(deltas, msg.agent_output.reasoning)
+                        _append_inline_reasoning_delta(deltas, msg)
                         _append_tool_call_deltas(deltas, msg, f"call_{i}_{j}", include_role=(j == 0))
 
                 elif action.HasField("update_task_message"):
                     update = action.update_task_message
                     message = update.message
                     mask_paths = set(update.mask.paths)
-                    if "server_message_data" in mask_paths or "agent_reasoning.finished_duration" in mask_paths:
+                    if (
+                        "server_message_data" in mask_paths
+                        or "serverMessageData" in mask_paths
+                        or "agent_reasoning.reasoning" in mask_paths
+                        or "agentReasoning.reasoning" in mask_paths
+                        or "agent_reasoning.finished_duration" in mask_paths
+                        or "agentReasoning.finishedDuration" in mask_paths
+                    ):
                         _append_reasoning_delta(deltas, _extract_reasoning_block(message))
                     elif not message.HasField("tool_call"):
                         logger.debug("Skipping update_task_message snapshot in SSE delta parser")

@@ -12,7 +12,7 @@ import json
 import uuid
 import hashlib
 import secrets
-from typing import Optional, AsyncGenerator, Dict, Any
+from typing import Optional, AsyncGenerator, Dict, Any, List
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
@@ -79,6 +79,24 @@ class WarpClient:
         if getattr(exc, "__context__", None) is not None and exc.__context__ is not exc.__cause__:
             parts.append(f"context={type(exc.__context__).__name__}: {exc.__context__!r}")
         return " | ".join(parts)
+
+    @staticmethod
+    def _extract_message_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts: List[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and isinstance(part.get("text"), str):
+                    text_parts.append(part["text"])
+                elif isinstance(part.get("text"), str):
+                    text_parts.append(part["text"])
+            return "\n".join(text_parts)
+        return str(content)
 
     def _log_trace(self, trace_id: Optional[str], event_name: str, **payload: Any) -> None:
         if not trace_id:
@@ -447,6 +465,7 @@ class WarpClient:
             # 提取最后一条用户消息、历史消息和工具结果
             user_message = ""
             history_messages = []
+            system_messages = []
             tool_results = []
             
             # 找到最后一个 assistant 消息的位置
@@ -463,10 +482,12 @@ class WarpClient:
             
             for i, msg in enumerate(messages):
                 role = msg.get("role", "")
-                content = msg.get("content")  # 可能是 None
+                raw_content = msg.get("content")  # 可能是 None
+                content = self._extract_message_text(raw_content) if raw_content is not None else None
                 
-                # 跳过 system 消息（Warp不支持）
                 if role == "system":
+                    if content:
+                        system_messages.append(content)
                     continue
                 
                 # 处理工具结果消息：提取最后一个用户消息之后的所有工具结果
@@ -506,7 +527,7 @@ class WarpClient:
                         # assistant 消息：可能有 content，也可能有 tool_calls
                         msg_dict = {"role": role}
                         # 如果有 content（即使是空字符串），也添加
-                        if content is not None:
+                        if raw_content is not None:
                             msg_dict["content"] = content
                         # 如果有 tool_calls，添加
                         if msg.get("tool_calls"):
@@ -561,6 +582,8 @@ class WarpClient:
                 "stream": stream,
                 "disable_warp_tools": disable_warp_tools,
                 "active_task_id": self.account.active_task_id,
+                "system_count": len(system_messages),
+                "system_messages": [summarize_message({"role": "system", "content": message}) for message in system_messages],
                 "user_message": truncate_text(user_message),
                 "history_count": len(history_messages),
                 "history_messages": [summarize_message(message) for message in history_messages],
@@ -608,6 +631,7 @@ class WarpClient:
                         model, 
                         disable_warp_tools,
                         history_messages=accumulated_history[:len(history_messages) + idx + 1],  # 逐步增加历史
+                        system_messages=system_messages,
                         task_id=self.account.active_task_id,
                         tools=request_tools,
                         tool_results=None  # 不使用 tool_results，而是放在 history 中
@@ -660,6 +684,7 @@ class WarpClient:
                     user_message, 
                     model, 
                     disable_warp_tools,
+                    system_messages=system_messages,
                     tools=request_tools
                 )
             else:
@@ -669,6 +694,7 @@ class WarpClient:
                     model, 
                     disable_warp_tools,
                     history_messages=history_messages,
+                    system_messages=system_messages,
                     task_id=self.account.active_task_id,
                     tools=request_tools,
                     tool_results=tool_results
@@ -683,6 +709,10 @@ class WarpClient:
                 if user_message:
                     logger.debug(f"  Current query: {user_message[:200]}..." if len(user_message) > 200 else f"  Current query: {user_message}")
                 logger.debug(f"  Model: {model}")
+                logger.debug(f"  System messages: {len(system_messages)}")
+                for i, system_message in enumerate(system_messages):
+                    content_preview = system_message[:100] + '...' if len(system_message) > 100 else system_message
+                    logger.debug(f"    [S{i}] {content_preview}")
                 logger.debug(f"  History messages: {len(history_messages)}")
                 for i, h in enumerate(history_messages):
                     content_preview = h['content'][:100] + '...' if len(h['content']) > 100 else h['content']
