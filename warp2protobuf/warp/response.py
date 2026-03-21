@@ -90,6 +90,24 @@ def _extract_openai_tool_call(tool_call: Any, fallback_id: str) -> tuple[Optiona
     return openai_tool_call, should_defer_tool_call(tool_name, tool_args)
 
 
+def _resolve_tool_call_delta_index(tool_call_id: str, tool_call_indices: Dict[str, int]) -> int:
+    if tool_call_id not in tool_call_indices:
+        tool_call_indices[tool_call_id] = len(tool_call_indices)
+    return tool_call_indices[tool_call_id]
+
+
+def _get_tool_call_delta_index(
+    message: Any,
+    fallback_id: str,
+    tool_call_indices: Dict[str, int],
+) -> Optional[int]:
+    if not hasattr(message, "HasField") or not message.HasField("tool_call"):
+        return None
+
+    tool_call_id = getattr(message.tool_call, "tool_call_id", "") or fallback_id
+    return _resolve_tool_call_delta_index(tool_call_id, tool_call_indices)
+
+
 def _upsert_tool_call(tool_calls: List[Dict[str, Any]], tool_call: Dict[str, Any]) -> None:
     for index, existing in enumerate(tool_calls):
         if existing.get("id") == tool_call.get("id"):
@@ -276,15 +294,26 @@ def _append_reasoning_delta(deltas: List[Dict[str, Any]], reasoning: Optional[st
         deltas.append({"choices": [{"index": 0, "delta": {"reasoning": reasoning}, "finish_reason": None}]})
 
 
-def _append_tool_call_deltas(deltas: List[Dict[str, Any]], message: Any, fallback_id: str, include_role: bool = True) -> None:
+def _append_tool_call_deltas(
+    deltas: List[Dict[str, Any]],
+    message: Any,
+    fallback_id: str,
+    tool_call_index: Optional[int] = None,
+    include_role: bool = True,
+) -> bool:
     if not message.HasField("tool_call"):
-        return
+        return False
 
     openai_tool_call, should_defer = _extract_openai_tool_call(message.tool_call, fallback_id)
     if openai_tool_call and not should_defer:
+        if tool_call_index is not None:
+            openai_tool_call = dict(openai_tool_call)
+            openai_tool_call["index"] = tool_call_index
         if include_role:
             deltas.append({"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
         deltas.append({"choices": [{"index": 0, "delta": {"tool_calls": [openai_tool_call]}, "finish_reason": None}]})
+        return True
+    return False
 
 
 def extract_openai_sse_deltas_from_response(payload: bytes) -> List[Dict[str, Any]]:
@@ -297,6 +326,8 @@ def extract_openai_sse_deltas_from_response(payload: bytes) -> List[Dict[str, An
         response = ResponseEvent()
         response.ParseFromString(payload)
         deltas: List[Dict[str, Any]] = []
+        tool_call_indices: Dict[str, int] = {}
+        saw_tool_calls = False
 
         if response.HasField("client_actions"):
             for i, action in enumerate(response.client_actions.actions):
@@ -306,14 +337,27 @@ def extract_openai_sse_deltas_from_response(payload: bytes) -> List[Dict[str, An
                         agent_output = message.agent_output
                         _append_text_delta(deltas, agent_output.text)
                     _append_inline_reasoning_delta(deltas, message)
-                    _append_tool_call_deltas(deltas, message, f"call_{i}")
+                    tool_call_index = _get_tool_call_delta_index(message, f"call_{i}", tool_call_indices)
+                    saw_tool_calls = _append_tool_call_deltas(
+                        deltas,
+                        message,
+                        f"call_{i}",
+                        tool_call_index=tool_call_index,
+                    ) or saw_tool_calls
 
                 elif action.HasField("add_messages_to_task"):
                     for j, msg in enumerate(action.add_messages_to_task.messages):
                         if msg.HasField("agent_output"):
                             _append_text_delta(deltas, msg.agent_output.text)
                         _append_inline_reasoning_delta(deltas, msg)
-                        _append_tool_call_deltas(deltas, msg, f"call_{i}_{j}", include_role=(j == 0))
+                        tool_call_index = _get_tool_call_delta_index(msg, f"call_{i}_{j}", tool_call_indices)
+                        saw_tool_calls = _append_tool_call_deltas(
+                            deltas,
+                            msg,
+                            f"call_{i}_{j}",
+                            tool_call_index=tool_call_index,
+                            include_role=(j == 0),
+                        ) or saw_tool_calls
 
                 elif action.HasField("update_task_message"):
                     update = action.update_task_message
@@ -332,7 +376,13 @@ def extract_openai_sse_deltas_from_response(payload: bytes) -> List[Dict[str, An
                         logger.debug("Skipping update_task_message snapshot in SSE delta parser")
 
                     if message.HasField("tool_call"):
-                        _append_tool_call_deltas(deltas, message, f"call_{i}")
+                        tool_call_index = _get_tool_call_delta_index(message, f"call_{i}", tool_call_indices)
+                        saw_tool_calls = _append_tool_call_deltas(
+                            deltas,
+                            message,
+                            f"call_{i}",
+                            tool_call_index=tool_call_index,
+                        ) or saw_tool_calls
 
                 elif action.HasField("create_task"):
                     logger.debug("Skipping create_task snapshot in SSE delta parser")
@@ -341,7 +391,8 @@ def extract_openai_sse_deltas_from_response(payload: bytes) -> List[Dict[str, An
                     logger.debug("Skipping update_task_summary snapshot in SSE delta parser")
 
         if response.HasField("finished"):
-            deltas.append({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            finish_reason = "tool_calls" if saw_tool_calls else "stop"
+            deltas.append({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]})
 
         return deltas
     except Exception as e:
