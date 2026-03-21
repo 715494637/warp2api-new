@@ -33,9 +33,6 @@ class AnthropicAdapter:
     ) -> List[dict]:
         """
         将 Anthropic 消息格式转换为 Warp 格式
-        
-        Anthropic: system 是单独参数，tool_result 在 user 消息的 content 中
-        Warp: system 是 messages 中的一条，tool 结果是单独的 tool role 消息
         """
         result = []
         
@@ -107,7 +104,7 @@ class AnthropicAdapter:
         input_tokens: int = 0
     ) -> AsyncGenerator[str, None]:
         """
-        将 Warp SSE 流转换为 Anthropic SSE 格式
+        将 Warp SSE 流转换为 Anthropic SSE 格式（重写为严格的流式状态机）
         """
         if not message_id:
             message_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -115,8 +112,9 @@ class AnthropicAdapter:
         content_started = False
         content_index = 0
         output_tokens = 0
-        tool_calls = []
-        current_tool_index = -1
+        
+        active_tools = {}  # 保存正在解析的工具状态 tc_index -> state
+        next_auto_tc_index = 0  # 容错：如果上游缺失 index 时用于自增
         
         yield f"event: message_start\ndata: {AnthropicAdapter._json_dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'model': model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': input_tokens, 'output_tokens': 0}}})}\n\n"
         
@@ -136,6 +134,7 @@ class AnthropicAdapter:
                             delta_content = choice.get("delta", {})
                             finish_reason = choice.get("finish_reason")
                             
+                            # 1. 处理纯文本
                             if "content" in delta_content and delta_content["content"]:
                                 text = delta_content["content"]
                                 
@@ -146,57 +145,91 @@ class AnthropicAdapter:
                                 yield f"event: content_block_delta\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_delta', 'index': content_index, 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
                                 output_tokens += len(text) // 4
                             
+                            # 2. 处理流式工具调用 (真正的流式)
                             if "tool_calls" in delta_content:
                                 for tc_delta in delta_content["tool_calls"]:
-                                    tc_index = tc_delta.get("index", 0)
-                                    
-                                    while len(tool_calls) <= tc_index:
-                                        tool_calls.append({
-                                            "id": "",
-                                            "name": "",
-                                            "arguments": ""
-                                        })
-                                    
-                                    if "id" in tc_delta:
-                                        tool_calls[tc_index]["id"] = tc_delta["id"]
-                                    if "function" in tc_delta:
-                                        func = tc_delta["function"]
-                                        if "name" in func:
-                                            tool_calls[tc_index]["name"] += func["name"]
-                                        if "arguments" in func:
-                                            tool_calls[tc_index]["arguments"] += func["arguments"]
-                                    
-                                    if tc_index > current_tool_index and tool_calls[tc_index]["id"]:
+                                    tc_index = tc_delta.get("index")
+                                    # 如果上游漏传了 index，通过是否包含新 ID 来隔离并发工具
+                                    if tc_index is None:
+                                        if "id" in tc_delta:
+                                            tc_index = next_auto_tc_index
+                                            next_auto_tc_index += 1
+                                        else:
+                                            tc_index = max(0, next_auto_tc_index - 1)
+                                    else:
+                                        next_auto_tc_index = max(next_auto_tc_index, tc_index + 1)
+                                        
+                                    if tc_index not in active_tools:
+                                        # 如果之前有打开的文本块，先关闭它
                                         if content_started:
                                             yield f"event: content_block_stop\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_stop', 'index': content_index})}\n\n"
                                             content_index += 1
                                             content_started = False
                                         
-                                        current_tool_index = tc_index
+                                        # 如果之前有打开的其它工具块，关闭它们（保证隔离）
+                                        for idx, state in active_tools.items():
+                                            if not state["stopped"] and state["started"]:
+                                                yield f"event: content_block_stop\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_stop', 'index': state['content_index']})}\n\n"
+                                                state["stopped"] = True
+
+                                        active_tools[tc_index] = {
+                                            "content_index": content_index,
+                                            "id": "",
+                                            "name": "",
+                                            "started": False,
+                                            "stopped": False
+                                        }
+                                        content_index += 1
+                                        
+                                    tool_state = active_tools[tc_index]
+                                    
+                                    # 更新 ID
+                                    if "id" in tc_delta:
+                                        tool_state["id"] = tc_delta["id"]
+                                        
+                                    # 处理 function 块
+                                    if "function" in tc_delta:
+                                        func = tc_delta["function"]
+                                        if "name" in func:
+                                            tool_state["name"] += func["name"]
+                                            
+                                        # 当拿到函数名，且还没发送 start 时，发射工具启动事件
+                                        if not tool_state["started"] and tool_state["name"]:
+                                            t_id = tool_state["id"] or f"toolu_{uuid.uuid4().hex[:16]}"
+                                            if not t_id.startswith("toolu_"):
+                                                t_id = f"toolu_{t_id}"
+                                            
+                                            yield f"event: content_block_start\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_start', 'index': tool_state['content_index'], 'content_block': {'type': 'tool_use', 'id': t_id, 'name': tool_state['name'], 'input': {}}})}\n\n"
+                                            tool_state["started"] = True
+                                            
+                                        # 实时流式发送参数片段，无需拼装
+                                        if "arguments" in func and func["arguments"]:
+                                            args_chunk = func["arguments"]
+                                            # 容错：防止遇到参数先于名字到达的情况
+                                            if not tool_state["started"]:
+                                                t_id = tool_state["id"] or f"toolu_{uuid.uuid4().hex[:16]}"
+                                                if not t_id.startswith("toolu_"):
+                                                    t_id = f"toolu_{t_id}"
+                                                yield f"event: content_block_start\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_start', 'index': tool_state['content_index'], 'content_block': {'type': 'tool_use', 'id': t_id, 'name': tool_state['name'] or 'unknown', 'input': {}}})}\n\n"
+                                                tool_state["started"] = True
+                                                
+                                            yield f"event: content_block_delta\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_delta', 'index': tool_state['content_index'], 'delta': {'type': 'input_json_delta', 'partial_json': args_chunk}})}\n\n"
                             
+                            # 3. 处理结束标识
                             if finish_reason:
                                 if content_started:
                                     yield f"event: content_block_stop\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_stop', 'index': content_index})}\n\n"
                                     content_index += 1
+                                    content_started = False
                                 
-                                for i, tc in enumerate(tool_calls):
-                                    if tc["id"] and tc["name"]:
-                                        try:
-                                            input_obj = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                                        except json.JSONDecodeError:
-                                            input_obj = {}
-                                        
-                                        tool_id = tc["id"]
-                                        if not tool_id.startswith("toolu_"):
-                                            tool_id = f"toolu_{tool_id}"
-                                        
-                                        yield f"event: content_block_start\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_start', 'index': content_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': tc['name'], 'input': {}}})}\n\n"
-                                        yield f"event: content_block_delta\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_delta', 'index': content_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(input_obj, ensure_ascii=False)}})}\n\n"
-                                        yield f"event: content_block_stop\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_stop', 'index': content_index})}\n\n"
-                                        content_index += 1
+                                # 关停所有未关闭的工具流
+                                for idx, state in active_tools.items():
+                                    if not state["stopped"] and state["started"]:
+                                        yield f"event: content_block_stop\ndata: {AnthropicAdapter._json_dumps({'type': 'content_block_stop', 'index': state['content_index']})}\n\n"
+                                        state["stopped"] = True
                                 
                                 stop_reason = "end_turn"
-                                if finish_reason == "tool_calls" or tool_calls:
+                                if finish_reason == "tool_calls" or active_tools:
                                     stop_reason = "tool_use"
                                 elif finish_reason == "length":
                                     stop_reason = "max_tokens"
@@ -209,6 +242,7 @@ class AnthropicAdapter:
                     except Exception as e:
                         logger.warning(f"Failed to use warp parser: {e}")
                 
+                # 保留原有的非 protobuf fallback 处理逻辑
                 if "client_actions" in event or "clientActions" in event:
                     actions_data = event.get("client_actions") or event.get("clientActions")
                     actions = actions_data.get("actions") or actions_data.get("Actions") or []
@@ -274,6 +308,7 @@ class AnthropicAdapter:
         input_tokens = 0
         output_tokens = 0
         stop_reason = "end_turn"
+        next_auto_tc_index = 0
         
         try:
             async for event in warp_stream:
@@ -293,7 +328,16 @@ class AnthropicAdapter:
                                 
                                 if "tool_calls" in delta_content:
                                     for tc_delta in delta_content["tool_calls"]:
-                                        tc_index = tc_delta.get("index", 0)
+                                        # 增加 index 缺失自增逻辑，防止并发崩溃
+                                        tc_index = tc_delta.get("index")
+                                        if tc_index is None:
+                                            if "id" in tc_delta:
+                                                tc_index = next_auto_tc_index
+                                                next_auto_tc_index += 1
+                                            else:
+                                                tc_index = max(0, next_auto_tc_index - 1)
+                                        else:
+                                            next_auto_tc_index = max(next_auto_tc_index, tc_index + 1)
                                         
                                         while len(tool_calls) <= tc_index:
                                             tool_calls.append({
@@ -322,6 +366,7 @@ class AnthropicAdapter:
                     except Exception as e:
                         logger.debug(f"Could not parse with warp parser: {e}")
                 
+                # 下方保留原有的 client_actions 和 token 计算逻辑
                 if "client_actions" in event or "clientActions" in event:
                     actions_data = event.get("client_actions") or event.get("clientActions")
                     actions = actions_data.get("actions") or actions_data.get("Actions") or []
